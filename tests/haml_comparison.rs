@@ -13,6 +13,12 @@ struct MatchPattern {
     has_action: bool,
 }
 
+/// Capture group results for a single match attempt:
+/// `None` means no match; `Some(groups)` means a match where `groups[0]` is
+/// the overall match span and `groups[i]` for `i > 0` is capture group `i`
+/// (`None` if that group did not participate in the match).
+type Captures = Option<Vec<Option<(usize, usize)>>>;
+
 /// A single difference between the two engines for one (pattern, line) pair.
 #[derive(Debug)]
 struct Difference {
@@ -21,8 +27,8 @@ struct Difference {
     has_action: bool,
     line_num: usize,
     line: String,
-    fancy_match: Option<(usize, usize)>,
-    onig_match: Option<(usize, usize)>,
+    fancy_captures: Captures,
+    onig_captures: Captures,
 }
 
 /// Extract the `variables` mapping from the parsed YAML document.
@@ -107,6 +113,32 @@ fn extract_match_patterns(
     patterns
 }
 
+/// Compile an onig regex with the appropriate options.
+/// `REGEX_OPTION_CAPTURE_GROUP` is always included so that unnamed capture
+/// groups are tracked even when named groups are also present in the pattern.
+fn compile_onig(pattern: &str, find_not_empty: bool) -> Result<onig::Regex, onig::Error> {
+    let mut options = onig::RegexOptions::REGEX_OPTION_CAPTURE_GROUP;
+    if find_not_empty {
+        options |= onig::RegexOptions::REGEX_OPTION_FIND_NOT_EMPTY;
+    }
+    onig::Regex::with_options(pattern, options, onig::Syntax::default())
+}
+
+/// Run onig against `line` and return all capture group spans.
+/// Returns `None` when there is no match, or `Some(groups)` where `groups[0]`
+/// is the overall match and `groups[i]` for `i > 0` is capture group `i`.
+fn onig_search(regex: &onig::Regex, line: &str) -> Captures {
+    let mut region = onig::Region::new();
+    let found = regex.search_with_options(
+        line,
+        0,
+        line.len(),
+        onig::SearchOptions::SEARCH_OPTION_NONE,
+        Some(&mut region),
+    );
+    found.map(|_| (0..region.len()).map(|i| region.pos(i)).collect())
+}
+
 #[test]
 fn compare_haml_patterns_vs_onig() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -155,17 +187,8 @@ fn compare_haml_patterns_vs_onig() {
                 // Even when fancy-regex fails to compile, try onig.  If onig can compile
                 // and find matches, every matching line counts as a difference (fancy-regex
                 // produces no result where onig does).
-                let onig_options = if find_not_empty {
-                    onig::RegexOptions::REGEX_OPTION_FIND_NOT_EMPTY
-                } else {
-                    onig::RegexOptions::REGEX_OPTION_NONE
-                };
-                let onig_compile_result = onig::Regex::with_options(
-                    &mp.pattern,
-                    onig_options,
-                    onig::Syntax::default(),
-                );
-                let onig_status = match &onig_compile_result {
+                let onig_result = compile_onig(&mp.pattern, find_not_empty);
+                let onig_status = match &onig_result {
                     Ok(_) => "onig compiled OK".to_string(),
                     Err(oe) => format!("onig also failed: {}", oe),
                 };
@@ -173,27 +196,19 @@ fn compare_haml_patterns_vs_onig() {
                     "fancy-regex compile error for {:?} (context={}, find_not_empty={}): {} [{}]",
                     mp.pattern, mp.context, find_not_empty, e, onig_status
                 ));
-                if let Ok(onig_re) = onig_compile_result {
+                if let Ok(onig_re) = onig_result {
                     patterns_tested += 1;
                     for (line_idx, line) in lines.iter().enumerate() {
-                        let mut region = onig::Region::new();
-                        let onig_found = onig_re.search_with_options(
-                            line,
-                            0,
-                            line.len(),
-                            onig::SearchOptions::SEARCH_OPTION_NONE,
-                            Some(&mut region),
-                        );
-                        if onig_found.is_some() {
-                            let onig_match = region.pos(0).expect("region group 0 missing");
+                        let onig_captures = onig_search(&onig_re, line);
+                        if onig_captures.is_some() {
                             differences.push(Difference {
                                 pattern: mp.pattern.clone(),
                                 context: mp.context.clone(),
                                 has_action: mp.has_action,
                                 line_num: line_idx + 1,
                                 line: line.to_string(),
-                                fancy_match: None,
-                                onig_match: Some(onig_match),
+                                fancy_captures: None,
+                                onig_captures,
                             });
                         }
                     }
@@ -205,58 +220,42 @@ fn compare_haml_patterns_vs_onig() {
         // --- Compile with onig ---
         // In Oniguruma, FIND_NOT_EMPTY is a compile-time regex option (RegexOptions),
         // so we compile the pattern with the flag set when appropriate.
-        let onig_options = if find_not_empty {
-            onig::RegexOptions::REGEX_OPTION_FIND_NOT_EMPTY
-        } else {
-            onig::RegexOptions::REGEX_OPTION_NONE
+        let onig_regex = match compile_onig(&mp.pattern, find_not_empty) {
+            Ok(r) => r,
+            Err(e) => {
+                compile_errors.push(format!(
+                    "onig compile error for {:?} (context={}, find_not_empty={}): {}",
+                    mp.pattern, mp.context, find_not_empty, e
+                ));
+                continue;
+            }
         };
-        let onig_regex =
-            match onig::Regex::with_options(&mp.pattern, onig_options, onig::Syntax::default()) {
-                Ok(r) => r,
-                Err(e) => {
-                    compile_errors.push(format!(
-                        "onig compile error for {:?} (context={}, find_not_empty={}): {}",
-                        mp.pattern, mp.context, find_not_empty, e
-                    ));
-                    continue;
-                }
-            };
 
         patterns_tested += 1;
 
         // --- Compare results for every line ---
         for (line_idx, line) in lines.iter().enumerate() {
-            // fancy-regex: find first match from position 0
-            let fancy_match: Option<(usize, usize)> = match &fancy_regex {
+            // fancy-regex: capture all groups from position 0
+            let fancy_captures: Captures = match &fancy_regex {
                 None => None,
-                Some(re) => re
-                    .find(line)
-                    .ok()
-                    .flatten()
-                    .map(|m| (m.start(), m.end())),
+                Some(re) => re.captures(line).ok().flatten().map(|caps| {
+                    (0..caps.len())
+                        .map(|i| caps.get(i).map(|m| (m.start(), m.end())))
+                        .collect()
+                }),
             };
 
-            // onig: search from byte 0 to end of string
-            let mut region = onig::Region::new();
-            let onig_found = onig_regex.search_with_options(
-                line,
-                0,
-                line.len(),
-                onig::SearchOptions::SEARCH_OPTION_NONE,
-                Some(&mut region),
-            );
-            let onig_match: Option<(usize, usize)> =
-                onig_found.map(|_| region.pos(0).expect("region group 0 missing"));
+            let onig_captures = onig_search(&onig_regex, line);
 
-            if fancy_match != onig_match {
+            if fancy_captures != onig_captures {
                 differences.push(Difference {
                     pattern: mp.pattern.clone(),
                     context: mp.context.clone(),
                     has_action: mp.has_action,
                     line_num: line_idx + 1,
                     line: line.to_string(),
-                    fancy_match,
-                    onig_match,
+                    fancy_captures,
+                    onig_captures,
                 });
             }
         }
@@ -292,8 +291,8 @@ fn compare_haml_patterns_vs_onig() {
                 !d.has_action,
                 d.line_num,
                 d.line,
-                d.fancy_match,
-                d.onig_match,
+                d.fancy_captures,
+                d.onig_captures,
             );
         }
         panic!(
