@@ -1,0 +1,9 @@
+[package]
+name = "fancy-regex-onig-comparison"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fancy-regex = { git = "https://github.com/fancy-regex/fancy-regex", branch = "find_not_empty" }
+onig = "6.5.1"
+serde_yaml = "0.9"
